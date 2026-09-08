@@ -1,0 +1,22 @@
+{
+  "name": "claimshare-staking",
+  "version": "1.0.0",
+  "description": "ClaimShare staking, soulbound position NFTs, and on-chain governance — audit package",
+  "license": "MIT",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "coverage": "hardhat coverage",
+    "size": "hardhat compile && hardhat size-contracts || true"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^4.0.0",
+    "hardhat": "^2.19.0",
+    "solidity-coverage": "^0.8.17",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "5.0.0"
+  }
+}
