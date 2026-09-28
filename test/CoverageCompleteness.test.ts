@@ -290,6 +290,18 @@ describe("Coverage — payout preferences", () => {
     expect(await staking.payoutPreference(1n, user.address)).to.equal(3);
     expect(await staking.payoutOnChainBps(1n, user.address)).to.equal(4000);
 
+    await expect(staking.connect(user).setPayoutPreference(1n, 1, 8000))
+      .to.emit(staking, "PayoutPreferenceSet")
+      .withArgs(1n, user.address, 1, 10_000);
+    expect(await staking.payoutPreference(1n, user.address)).to.equal(1);
+    expect(await staking.payoutOnChainBps(1n, user.address)).to.equal(10_000);
+
+    await expect(staking.connect(user).setPayoutPreference(1n, 2, 8000))
+      .to.emit(staking, "PayoutPreferenceSet")
+      .withArgs(1n, user.address, 2, 0);
+    expect(await staking.payoutPreference(1n, user.address)).to.equal(2);
+    expect(await staking.payoutOnChainBps(1n, user.address)).to.equal(0);
+
     await staking.connect(owner).closeCase(1n);
     await expect(staking.connect(user).setPayoutPreference(1n, 1, 0)).to.be.revertedWithCustomError(
       staking,

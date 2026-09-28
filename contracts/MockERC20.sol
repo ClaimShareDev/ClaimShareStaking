@@ -18,3 +18,33 @@ contract MockERC20 is ERC20 {
         _mint(to, amount);
     }
 }
+
+/// @dev Test-only token that burns `feeBps` of each transfer. Not used in production.
+contract FeeOnTransferMock is ERC20 {
+    uint256 public feeBps;
+
+    constructor(uint256 feeBps_) ERC20("Fee CLAIM", "fCLAIM") {
+        feeBps = feeBps_;
+    }
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+
+    function transfer(address to, uint256 value) public override returns (bool) {
+        _transferWithFee(msg.sender, to, value);
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 value) public override returns (bool) {
+        _spendAllowance(from, msg.sender, value);
+        _transferWithFee(from, to, value);
+        return true;
+    }
+
+    function _transferWithFee(address from, address to, uint256 value) internal {
+        uint256 fee = (value * feeBps) / 10_000;
+        _transfer(from, to, value - fee);
+        if (fee > 0) _burn(from, fee);
+    }
+}

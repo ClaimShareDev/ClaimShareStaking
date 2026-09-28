@@ -9,7 +9,8 @@ import {ClaimSharePausable} from "./ClaimSharePausable.sol";
 import {PlatformPositionNFT, CasePositionNFT} from "./ClaimSharePositionNFT.sol";
 
 /// @title ClaimShareStaking — staking, cases, on-chain governance, payout preferences.
-/// @dev VP starts at weightStart (0.5× platform / 0.75× case) at stake and ramps linearly to weightEnd.
+/// @dev VP ramps linearly from the weight config snapshotted onto the position at stake.
+///      Later global weight updates apply only to new positions.
 ///      Lock only blocks unstake — not voting.
 contract ClaimShareStaking is ReentrancyGuard, ClaimSharePausable {
     using SafeERC20 for IERC20;
@@ -47,6 +48,10 @@ contract ClaimShareStaking is ReentrancyGuard, ClaimSharePausable {
         PositionKind kind;
         uint256 caseId;
         bool closed;
+        /// @dev Weight curve copied from the global config at stake time.
+        uint256 weightStartWad;
+        uint256 weightEndWad;
+        uint256 durationSeconds;
     }
 
     struct CaseInfo {
@@ -181,6 +186,8 @@ contract ClaimShareStaking is ReentrancyGuard, ClaimSharePausable {
     }
 
     /// @notice Before closeCase: user picks full/partial on-chain vs off-chain payout (advisory; used off-chain).
+    /// @dev FullOnChain always stores BPS (10_000). FullOffChain always stores 0.
+    ///      Partial stores the provided on-chain bps (1..9999). Caller BPS is ignored for full modes.
     function setPayoutPreference(uint256 caseId, PayoutPreference preference, uint256 onChainPortionBps)
         external
         whenNotPaused
@@ -189,13 +196,20 @@ contract ClaimShareStaking is ReentrancyGuard, ClaimSharePausable {
         if (!c.registered) revert CaseNotRegistered();
         if (c.closed) revert CaseIsClosed();
         if (preference == PayoutPreference.NotSet) revert InvalidPreference();
-        if (preference == PayoutPreference.Partial) {
+
+        uint256 normalizedBps;
+        if (preference == PayoutPreference.FullOnChain) {
+            normalizedBps = BPS;
+        } else if (preference == PayoutPreference.FullOffChain) {
+            normalizedBps = 0;
+        } else {
             if (onChainPortionBps == 0 || onChainPortionBps >= BPS) revert InvalidBps();
+            normalizedBps = onChainPortionBps;
         }
 
         payoutPreference[caseId][msg.sender] = preference;
-        payoutOnChainBps[caseId][msg.sender] = onChainPortionBps;
-        emit PayoutPreferenceSet(caseId, msg.sender, preference, onChainPortionBps);
+        payoutOnChainBps[caseId][msg.sender] = normalizedBps;
+        emit PayoutPreferenceSet(caseId, msg.sender, preference, normalizedBps);
     }
 
     // ─── On-chain polls (multi-option) ───
@@ -377,8 +391,9 @@ contract ClaimShareStaking is ReentrancyGuard, ClaimSharePausable {
         whenNotPaused
         returns (uint256 positionId)
     {
-        positionId = _stake(amount, PositionKind.Platform, 0, uri);
-        emit StakedPlatform(msg.sender, positionId, amount);
+        uint256 credited;
+        (positionId, credited) = _stake(amount, PositionKind.Platform, 0, uri);
+        emit StakedPlatform(msg.sender, positionId, credited);
     }
 
     function stakeCase(uint256 caseId, uint256 amount, string calldata uri)
@@ -389,8 +404,9 @@ contract ClaimShareStaking is ReentrancyGuard, ClaimSharePausable {
     {
         CaseInfo storage c = cases[caseId];
         if (!c.registered || !c.active || c.closed) revert CaseNotActive();
-        positionId = _stake(amount, PositionKind.Case, caseId, uri);
-        emit StakedCase(msg.sender, caseId, positionId, amount);
+        uint256 credited;
+        (positionId, credited) = _stake(amount, PositionKind.Case, caseId, uri);
+        emit StakedCase(msg.sender, caseId, positionId, credited);
     }
 
     function unstake(uint256 positionId) external nonReentrant whenNotPaused {
@@ -443,23 +459,31 @@ contract ClaimShareStaking is ReentrancyGuard, ClaimSharePausable {
         if (!cases[p.caseId].registered) revert CaseNotRegistered();
     }
 
+    /// @dev Pulls `amount`, then credits only the balance increase. For a standard token this equals `amount`.
     function _stake(uint256 amount, PositionKind kind, uint256 caseId, string calldata uri)
         internal
-        returns (uint256 positionId)
+        returns (uint256 positionId, uint256 credited)
     {
         if (amount == 0) revert ZeroAmount();
         if (bytes(uri).length == 0) revert EmptyURI();
+        uint256 beforeBal = stakeToken.balanceOf(address(this));
         stakeToken.safeTransferFrom(msg.sender, address(this), amount);
+        credited = stakeToken.balanceOf(address(this)) - beforeBal;
+        if (credited == 0) revert ZeroAmount();
         positionId = _nextPositionId++;
         uint256 stakedAt = block.timestamp;
+        WeightConfig storage cfg = kind == PositionKind.Platform ? platformWeights : caseWeights;
         positions[positionId] = Position({
-            amount: amount,
+            amount: credited,
             stakedAt: stakedAt,
             lockEnd: stakedAt + lockDuration,
             owner: msg.sender,
             kind: kind,
             caseId: caseId,
-            closed: false
+            closed: false,
+            weightStartWad: cfg.weightStartWad,
+            weightEndWad: cfg.weightEndWad,
+            durationSeconds: cfg.durationSeconds
         });
         if (kind == PositionKind.Platform) platformNFT.mint(msg.sender, positionId, uri);
         else caseNFT.mint(msg.sender, positionId, uri);
@@ -467,11 +491,10 @@ contract ClaimShareStaking is ReentrancyGuard, ClaimSharePausable {
 
     function _weightWadAt(Position storage p, uint256 timestamp) internal view returns (uint256) {
         if (timestamp < p.stakedAt) return 0;
-        WeightConfig storage cfg = p.kind == PositionKind.Platform ? platformWeights : caseWeights;
         uint256 elapsed = timestamp - p.stakedAt;
-        if (cfg.durationSeconds == 0) return cfg.weightEndWad;
-        if (elapsed >= cfg.durationSeconds) return cfg.weightEndWad;
-        return cfg.weightStartWad + ((cfg.weightEndWad - cfg.weightStartWad) * elapsed) / cfg.durationSeconds;
+        if (p.durationSeconds == 0) return p.weightEndWad;
+        if (elapsed >= p.durationSeconds) return p.weightEndWad;
+        return p.weightStartWad + ((p.weightEndWad - p.weightStartWad) * elapsed) / p.durationSeconds;
     }
 
     function _validateWeightConfig(uint256 weightStartWad, uint256 weightEndWad, uint256 durationSeconds) internal pure {
