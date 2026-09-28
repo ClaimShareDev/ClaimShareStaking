@@ -65,7 +65,7 @@ All roles are granted to the deployer's `admin` at construction. Downstream role
 2. `emergencyWithdraw` cannot reduce the `stakeToken` balance.
 3. Each position is minted exactly one soulbound NFT; NFT is non-transferable while owned by a non-zero address.
 4. Voting power of a closed / zero-amount position is `0`.
-5. Voting power is monotonically non-decreasing in time within `[stakedAt, stakedAt + weightDuration]` and constant afterwards.
+5. Voting power is monotonically non-decreasing in time within `[stakedAt, stakedAt + position.durationSeconds]` and constant afterwards. Each position uses the weight curve snapshotted at stake; later global updates do not change existing positions or `votingPowerOfPositionAt`.
 6. One vote per `(pollId, positionId)`; per-vote weight ≤ `votingPowerOfPosition(positionId)`.
 7. Poll deadlines only move forward; `finalizePoll` cannot run before the deadline.
 8. `wireStaking` on each position NFT is settable exactly once, to a non-zero address.
