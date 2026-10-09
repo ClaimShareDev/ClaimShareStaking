@@ -69,16 +69,32 @@ contract ClaimShareStaking is ReentrancyGuard, ClaimSharePausable {
         uint8 optionCount;
         uint8 winningOption;
         string metadataURI;
+        /// @dev Sum of all vote weights cast on this poll.
+        uint256 totalVotes;
     }
 
     uint8 public constant MIN_POLL_OPTIONS = 2;
     uint8 public constant MAX_POLL_OPTIONS = 16;
+    /// @notice `winningOption` value meaning "no winner": the poll is not finalized yet, or nobody voted.
+    uint8 public constant NO_WINNER = type(uint8).max;
 
+    /// @notice Token users stake. Set once at deploy.
+    /// @dev Supported: an ERC-20 whose balances change only through transfers (no rebasing).
+    ///      Transfer fees deducted from the amount moved are supported in both directions:
+    ///      a stake credits only what arrives, and on unstake the holder bears the fee
+    ///      (`UnstakeReceived` reports what arrived). A token that takes more than the
+    ///      transfer amount from the sender is not supported: unstake reverts with
+    ///      `UnsupportedStakeToken` instead of paying from other positions.
     IERC20 public immutable stakeToken;
     PlatformPositionNFT public immutable platformNFT;
     CasePositionNFT public immutable caseNFT;
 
     uint256 private _nextPositionId = 1;
+
+    /// @notice Sum of all open position amounts, i.e. what the contract owes stakers.
+    /// @dev For a supported token, stakeToken.balanceOf(this) >= totalStaked always holds.
+    ///      Tokens sent directly to the contract are never credited to any position.
+    uint256 public totalStaked;
 
     uint256 public lockDuration;
     WeightConfig public platformWeights;
@@ -92,10 +108,16 @@ contract ClaimShareStaking is ReentrancyGuard, ClaimSharePausable {
     mapping(uint256 pollId => Poll) public polls;
     mapping(uint256 pollId => mapping(uint8 optionIndex => uint256)) public pollOptionVotes;
     mapping(uint256 pollId => mapping(uint256 positionId => bool)) public hasVotedOnPoll;
+    /// @notice Latest deadline of any poll the position voted on. The position cannot be unstaked
+    ///         until this time has passed, so its tokens cannot vote again in the same poll.
+    mapping(uint256 positionId => uint256) public voteLockedUntil;
 
     event StakedPlatform(address indexed user, uint256 indexed positionId, uint256 amount);
     event StakedCase(address indexed user, uint256 indexed caseId, uint256 indexed positionId, uint256 amount);
+    /// @dev `amount` is the position amount the contract sent.
     event Unstaked(address indexed user, uint256 indexed positionId, uint256 amount);
+    /// @dev What the holder actually received; lower than `Unstaked.amount` only if the token took a fee.
+    event UnstakeReceived(address indexed user, uint256 indexed positionId, uint256 received);
     event CaseRegistered(uint256 indexed caseId, string metadataURI);
     event CaseDeactivated(uint256 indexed caseId);
     event CaseClosed(uint256 indexed caseId, uint256 closedAt);
@@ -217,6 +239,8 @@ contract ClaimShareStaking is ReentrancyGuard, ClaimSharePausable {
     /// @param optionCount Number of choices (2–16). Must match options array length in metadataURI JSON.
     /// @param metadataURI IPFS (or HTTPS) URI to poll JSON: title, description, option labels.
     /// @dev Polls are independent of cases. Platform: voteOnPoll. Case stake: voteOnPollCase.
+    ///      Results are display-only: nothing on-chain or off-chain acts on `winningOption`.
+    ///      Voting locks the position until the poll's deadline (see `voteLockedUntil`).
     function createPoll(
         uint256 pollId,
         uint256 votingDurationSeconds,
@@ -233,13 +257,15 @@ contract ClaimShareStaking is ReentrancyGuard, ClaimSharePausable {
             finalized: false,
             deadline: block.timestamp + votingDurationSeconds,
             optionCount: optionCount,
-            winningOption: 0,
-            metadataURI: metadataURI
+            winningOption: NO_WINNER,
+            metadataURI: metadataURI,
+            totalVotes: 0
         });
         emit PollCreated(pollId, polls[pollId].deadline, optionCount, metadataURI);
     }
 
-    /// @notice Platform position votes on a poll (one vote per position).
+    /// @notice Platform position votes on a poll (one vote per position). The position stays locked
+    ///         until the poll's deadline.
     function voteOnPoll(uint256 pollId, uint256 positionId, uint8 optionIndex, uint256 weight) external whenNotPaused {
         Position storage p = positions[positionId];
         _requirePlatformPositionForPoll(p);
@@ -247,6 +273,7 @@ contract ClaimShareStaking is ReentrancyGuard, ClaimSharePausable {
     }
 
     /// @notice Case position votes on a poll (one vote per position). Case must be registered.
+    ///         The position stays locked until the poll's deadline.
     function voteOnPollCase(uint256 pollId, uint256 positionId, uint8 optionIndex, uint256 weight)
         external
         whenNotPaused
@@ -256,7 +283,8 @@ contract ClaimShareStaking is ReentrancyGuard, ClaimSharePausable {
         _castPollVote(pollId, positionId, optionIndex, weight, p);
     }
 
-    /// @notice Extend a poll's deadline. New deadline must be strictly greater than the current one.
+    /// @notice Extend a poll's deadline. The new deadline must be later than the current one and in the future.
+    /// @dev Only allowed before the first vote, so the unlock time voters saw when voting never changes.
     function extendPollDeadline(uint256 pollId, uint256 newDeadline)
         external
         onlyRole(GOVERNANCE_ADMIN_ROLE)
@@ -264,7 +292,9 @@ contract ClaimShareStaking is ReentrancyGuard, ClaimSharePausable {
         Poll storage poll = polls[pollId];
         if (!poll.exists) revert PollNotFound();
         if (poll.finalized) revert PollIsFinalized();
+        if (poll.totalVotes > 0) revert PollHasVotes();
         if (newDeadline <= poll.deadline) revert DeadlineNotExtended();
+        if (newDeadline <= block.timestamp) revert InvalidDeadline();
         poll.deadline = newDeadline;
         emit PollDeadlineExtended(pollId, newDeadline);
     }
@@ -291,12 +321,15 @@ contract ClaimShareStaking is ReentrancyGuard, ClaimSharePausable {
 
         hasVotedOnPoll[pollId][positionId] = true;
         pollOptionVotes[pollId][optionIndex] += weight;
+        poll.totalVotes += weight;
+        // Lock the position until the latest deadline it has voted on.
+        if (poll.deadline > voteLockedUntil[positionId]) voteLockedUntil[positionId] = poll.deadline;
 
         emit PollVoteCast(pollId, msg.sender, positionId, optionIndex, weight);
     }
 
-    /// @dev Sets winningOption to the option with the highest vote weight (lowest index on tie).
-    ///      Requires the voting deadline to have passed, preventing early forced finalization.
+    /// @dev Sets winningOption to the option with the highest vote weight (lowest index on tie),
+    ///      or NO_WINNER if nobody voted. Requires the voting deadline to have passed.
     function finalizePoll(uint256 pollId) external onlyRole(GOVERNANCE_ADMIN_ROLE) {
         Poll storage poll = polls[pollId];
         if (!poll.exists) revert PollNotFound();
@@ -304,9 +337,9 @@ contract ClaimShareStaking is ReentrancyGuard, ClaimSharePausable {
         if (block.timestamp <= poll.deadline) revert PollNotExpired();
         poll.finalized = true;
 
-        uint8 winner = 0;
-        uint256 top = pollOptionVotes[pollId][0];
-        for (uint8 i = 1; i < poll.optionCount; i++) {
+        uint8 winner = NO_WINNER;
+        uint256 top;
+        for (uint8 i = 0; i < poll.optionCount; i++) {
             uint256 v = pollOptionVotes[pollId][i];
             if (v > top) {
                 top = v;
@@ -409,16 +442,31 @@ contract ClaimShareStaking is ReentrancyGuard, ClaimSharePausable {
         emit StakedCase(msg.sender, caseId, positionId, credited);
     }
 
+    /// @notice Close a position after its lock and send its full amount to the owner.
+    ///         A position that voted stays locked until every poll it voted on has ended.
+    /// @dev The contract's balance must drop by exactly the position amount, so a token that
+    ///      charges the sender extra can never pay out of other positions. A fee deducted from
+    ///      the transfer is borne by the holder and shows in `UnstakeReceived`.
     function unstake(uint256 positionId) external nonReentrant whenNotPaused {
         Position storage p = positions[positionId];
         if (p.owner != msg.sender) revert NotOwner();
         if (p.closed) revert PositionClosed();
         if (block.timestamp < p.lockEnd) revert StillLocked();
+        if (block.timestamp <= voteLockedUntil[positionId]) revert LockedByVote();
         uint256 amount = p.amount;
         p.amount = 0;
         p.closed = true;
+        totalStaked -= amount;
+
+        uint256 contractBefore = stakeToken.balanceOf(address(this));
+        uint256 holderBefore = stakeToken.balanceOf(msg.sender);
         stakeToken.safeTransfer(msg.sender, amount);
+        if (contractBefore != stakeToken.balanceOf(address(this)) + amount) revert UnsupportedStakeToken();
+        uint256 holderAfter = stakeToken.balanceOf(msg.sender);
+        uint256 received = holderAfter > holderBefore ? holderAfter - holderBefore : 0;
+
         emit Unstaked(msg.sender, positionId, amount);
+        emit UnstakeReceived(msg.sender, positionId, received);
     }
 
     // ─── Views ───
@@ -470,6 +518,7 @@ contract ClaimShareStaking is ReentrancyGuard, ClaimSharePausable {
         stakeToken.safeTransferFrom(msg.sender, address(this), amount);
         credited = stakeToken.balanceOf(address(this)) - beforeBal;
         if (credited == 0) revert ZeroAmount();
+        totalStaked += credited;
         positionId = _nextPositionId++;
         uint256 stakedAt = block.timestamp;
         WeightConfig storage cfg = kind == PositionKind.Platform ? platformWeights : caseWeights;
@@ -530,4 +579,7 @@ contract ClaimShareStaking is ReentrancyGuard, ClaimSharePausable {
     error DeadlineNotExtended();
     error CannotWithdrawStakeToken();
     error InvalidPreference();
+    error UnsupportedStakeToken();
+    error LockedByVote();
+    error PollHasVotes();
 }
