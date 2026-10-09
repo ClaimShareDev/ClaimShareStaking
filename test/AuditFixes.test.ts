@@ -1,6 +1,7 @@
 import { expect } from "chai";
 import { ethers } from "hardhat";
 import { time } from "@nomicfoundation/hardhat-network-helpers";
+import type { FeeOnTopMock, FeeOnTransferMock } from "../typechain-types";
 import {
   CASE_WEIGHT_END,
   CASE_WEIGHT_START,
@@ -17,8 +18,15 @@ import {
 
 describe("CLA-02 — credit tokens actually received", () => {
   async function deployWithFeeToken(feeBps: bigint) {
-    const [owner, user] = await ethers.getSigners();
-    const claim = await (await ethers.getContractFactory("FeeOnTransferMock")).deploy(feeBps);
+    return deployStakingFor(await (await ethers.getContractFactory("FeeOnTransferMock")).deploy(feeBps));
+  }
+
+  async function deployWithFeeOnTopToken(feeBps: bigint) {
+    return deployStakingFor(await (await ethers.getContractFactory("FeeOnTopMock")).deploy(feeBps));
+  }
+
+  async function deployStakingFor<T extends FeeOnTransferMock | FeeOnTopMock>(claim: T) {
+    const [owner, user, other] = await ethers.getSigners();
     const platformNFT = await (await ethers.getContractFactory("PlatformPositionNFT")).deploy(owner.address);
     const caseNFT = await (await ethers.getContractFactory("CasePositionNFT")).deploy(owner.address);
     const platformWeights = {
@@ -48,20 +56,33 @@ describe("CLA-02 — credit tokens actually received", () => {
     await caseNFT.connect(owner).wireStaking(stakingAddr);
     await platformNFT.connect(owner).grantRole(minter, stakingAddr);
     await caseNFT.connect(owner).grantRole(minter, stakingAddr);
-    await claim.mint(user.address, ethers.parseEther("10000"));
-    await claim.connect(user).approve(stakingAddr, ethers.MaxUint256);
-    return { owner, user, claim, staking, stakingAddr };
+    for (const s of [user, other]) {
+      await claim.mint(s.address, ethers.parseEther("10000"));
+      await claim.connect(s).approve(stakingAddr, ethers.MaxUint256);
+    }
+    return { owner, user, other, claim, staking, stakingAddr };
   }
 
-  it("standard token still credits the full requested amount", async () => {
+  it("standard token still credits and returns the full amount", async () => {
     const { user, staking, claim } = await deployTestStack();
     const amt = ethers.parseEther("1000");
-    const before = await claim.balanceOf(await staking.getAddress());
+    const stakingAddr = await staking.getAddress();
+    const before = await claim.balanceOf(stakingAddr);
     await expect(staking.connect(user).stakePlatform(amt, meta("full")))
       .to.emit(staking, "StakedPlatform")
       .withArgs(user.address, 1n, amt);
     expect((await staking.positions(1n)).amount).to.equal(amt);
-    expect(await claim.balanceOf(await staking.getAddress())).to.equal(before + amt);
+    expect(await staking.totalStaked()).to.equal(amt);
+    expect(await claim.balanceOf(stakingAddr)).to.equal(before + amt);
+
+    await time.increase(61);
+    await expect(staking.connect(user).unstake(1n))
+      .to.emit(staking, "Unstaked")
+      .withArgs(user.address, 1n, amt)
+      .and.to.emit(staking, "UnstakeReceived")
+      .withArgs(user.address, 1n, amt);
+    expect(await staking.totalStaked()).to.equal(0n);
+    expect(await claim.balanceOf(stakingAddr)).to.equal(before);
   });
 
   it("fee-on-transfer token credits only what arrived, and unstake returns that", async () => {
@@ -83,12 +104,19 @@ describe("CLA-02 — credit tokens actually received", () => {
       .withArgs(user.address, 1n, 2n, received);
     expect((await staking.positions(2n)).amount).to.equal(received);
 
+    expect(await staking.totalStaked()).to.equal(2n * received);
+
     await time.increase(61);
     const userBefore = await claim.balanceOf(user.address);
-    await staking.connect(user).unstake(1n);
-    // Outbound transfer can also take a fee. The contract sends the credited amount.
+    // The contract sends the full credited amount; the outbound fee is borne by the holder.
     const outboundFee = (received * 1000n) / 10_000n;
+    await expect(staking.connect(user).unstake(1n))
+      .to.emit(staking, "Unstaked")
+      .withArgs(user.address, 1n, received)
+      .and.to.emit(staking, "UnstakeReceived")
+      .withArgs(user.address, 1n, received - outboundFee);
     expect(await claim.balanceOf(user.address) - userBefore).to.equal(received - outboundFee);
+    expect(await staking.totalStaked()).to.equal(received);
     expect(await claim.balanceOf(stakingAddr)).to.equal(received);
   });
 
@@ -98,6 +126,64 @@ describe("CLA-02 — credit tokens actually received", () => {
       staking,
       "ZeroAmount"
     );
+  });
+
+  it("a fee switched on after staking is borne by the holder; the pool stays fully backed", async () => {
+    const { user, other, claim, staking, stakingAddr } = await deployWithFeeToken(0n);
+    const amt = ethers.parseEther("1000");
+    await staking.connect(user).stakePlatform(amt, meta("a"));
+    await staking.connect(other).stakePlatform(amt, meta("b"));
+    expect(await staking.totalStaked()).to.equal(2n * amt);
+    await time.increase(61);
+
+    await claim.setFeeBps(5000n); // 50% outbound fee
+    await expect(staking.connect(user).unstake(1n))
+      .to.emit(staking, "Unstaked")
+      .withArgs(user.address, 1n, amt)
+      .and.to.emit(staking, "UnstakeReceived")
+      .withArgs(user.address, 1n, amt / 2n);
+    expect(await staking.totalStaked()).to.equal(amt);
+    expect(await claim.balanceOf(stakingAddr)).to.equal(amt);
+
+    await claim.setFeeBps(10_000n); // fee takes everything: holder receives nothing, pool still balanced
+    const otherBefore = await claim.balanceOf(other.address);
+    await expect(staking.connect(other).unstake(2n))
+      .to.emit(staking, "UnstakeReceived")
+      .withArgs(other.address, 2n, 0n);
+    expect(await claim.balanceOf(other.address)).to.equal(otherBefore);
+    expect(await staking.totalStaked()).to.equal(0n);
+    expect(await claim.balanceOf(stakingAddr)).to.equal(0n);
+  });
+
+  it("a token that charges the sender extra cannot pay out of other positions", async () => {
+    const { user, other, claim, staking, stakingAddr } = await deployWithFeeOnTopToken(1000n); // 10% on top
+    const amt = ethers.parseEther("1000");
+    // The staker pays the extra fee; the contract receives and credits the full amount.
+    await staking.connect(user).stakePlatform(amt, meta("a"));
+    await staking.connect(other).stakePlatform(amt, meta("b"));
+    expect((await staking.positions(1n)).amount).to.equal(amt);
+    expect(await staking.totalStaked()).to.equal(2n * amt);
+    expect(await claim.balanceOf(stakingAddr)).to.equal(2n * amt);
+
+    await time.increase(61);
+    await expect(staking.connect(user).unstake(1n)).to.be.revertedWithCustomError(staking, "UnsupportedStakeToken");
+    // Nothing moved: the position is still open and both positions remain fully backed.
+    expect((await staking.positions(1n)).closed).to.equal(false);
+    expect(await staking.totalStaked()).to.equal(2n * amt);
+    expect(await claim.balanceOf(stakingAddr)).to.equal(2n * amt);
+  });
+
+  it("tokens sent directly to the contract are never credited to a position", async () => {
+    const { user, other, claim, staking } = await deployTestStack();
+    const stakingAddr = await staking.getAddress();
+    const stray = ethers.parseEther("500");
+    await claim.connect(other).transfer(stakingAddr, stray);
+
+    const amt = ethers.parseEther("100");
+    await staking.connect(user).stakePlatform(amt, meta("p"));
+    expect((await staking.positions(1n)).amount).to.equal(amt);
+    expect(await staking.totalStaked()).to.equal(amt);
+    expect(await claim.balanceOf(stakingAddr)).to.equal(amt + stray);
   });
 });
 
@@ -348,5 +434,126 @@ describe("CLA-04 — per-position weight snapshot", () => {
     );
     expect(await platformNFT.votingPower(1n)).to.equal(expected);
     expect(await platformNFT.votingPower(1n)).to.equal(await staking.votingPower(1n));
+  });
+});
+
+describe("CLA-05 — vote lock and empty-poll result", () => {
+  it("anyone can vote, including positions staked after the poll opened", async () => {
+    const { owner, user, other, staking } = await deployTestStack();
+    await staking.connect(owner).registerCase(1n, meta("c"));
+    await staking.connect(owner).createPoll(1n, 3600n, 2, pollMeta(1, 2));
+    await staking.connect(user).stakePlatform(ethers.parseEther("100"), meta("late"));
+    await staking.connect(other).stakeCase(1n, ethers.parseEther("100"), meta("late-case"));
+
+    await expect(staking.connect(user).voteOnPoll(1n, 1n, 0, 1n)).to.emit(staking, "PollVoteCast");
+    await expect(staking.connect(other).voteOnPollCase(1n, 2n, 1, 1n)).to.emit(staking, "PollVoteCast");
+  });
+
+  it("a position that voted stays locked until the poll ends, so its tokens cannot vote twice", async () => {
+    const { owner, user, other, staking, lockSeconds } = await deployTestStack();
+    const amt = ethers.parseEther("100");
+    await staking.connect(user).stakePlatform(amt, meta("voter"));
+    await staking.connect(other).stakePlatform(amt, meta("non-voter"));
+    await staking.connect(owner).createPoll(1n, 3600n, 2, pollMeta(1, 2));
+    await staking.connect(user).voteOnPoll(1n, 1n, 0, 1n);
+    const { deadline } = await staking.pollState(1n);
+    expect(await staking.voteLockedUntil(1n)).to.equal(deadline);
+    expect(await staking.voteLockedUntil(2n)).to.equal(0n);
+
+    // The normal lock is over but the poll is still open: the voter cannot take the tokens out
+    // to vote again through a new position. A position that never voted is not affected.
+    await time.increase(Number(lockSeconds) + 1);
+    await expect(staking.connect(user).unstake(1n)).to.be.revertedWithCustomError(staking, "LockedByVote");
+    await expect(staking.connect(other).unstake(2n)).to.emit(staking, "Unstaked");
+
+    // Still locked just before the deadline; free once the deadline has passed.
+    await time.increaseTo(deadline - 10n);
+    await expect(staking.connect(user).unstake(1n)).to.be.revertedWithCustomError(staking, "LockedByVote");
+    await time.increaseTo(deadline);
+    await expect(staking.connect(user).unstake(1n)).to.emit(staking, "Unstaked");
+
+    // The vote still counts once, and only once.
+    expect((await staking.polls(1n)).totalVotes).to.equal(1n);
+  });
+
+  it("the lock runs until the last deadline among the polls voted on", async () => {
+    const { owner, user, staking } = await deployTestStack();
+    await staking.connect(user).stakePlatform(ethers.parseEther("100"), meta("p"));
+    await staking.connect(owner).createPoll(1n, 3600n, 2, pollMeta(1, 2)); // short
+    await staking.connect(owner).createPoll(2n, 7200n, 2, pollMeta(2, 2)); // long
+    await staking.connect(owner).createPoll(3n, 1800n, 2, pollMeta(3, 2)); // shortest
+    const short = (await staking.pollState(1n)).deadline;
+    const long = (await staking.pollState(2n)).deadline;
+
+    await staking.connect(user).voteOnPoll(1n, 1n, 0, 1n);
+    expect(await staking.voteLockedUntil(1n)).to.equal(short);
+    await staking.connect(user).voteOnPoll(2n, 1n, 0, 1n); // a later deadline moves the lock out
+    expect(await staking.voteLockedUntil(1n)).to.equal(long);
+    await staking.connect(user).voteOnPoll(3n, 1n, 0, 1n); // an earlier deadline never shortens it
+    expect(await staking.voteLockedUntil(1n)).to.equal(long);
+
+    await time.increaseTo(short + 1n);
+    await expect(staking.connect(user).unstake(1n)).to.be.revertedWithCustomError(staking, "LockedByVote");
+    await time.increaseTo(long + 1n);
+    await expect(staking.connect(user).unstake(1n)).to.emit(staking, "Unstaked");
+  });
+
+  it("voting keeps the stake in even with no lock duration, so borrowed tokens cannot vote and leave", async () => {
+    const { owner, user, staking } = await deployTestStack();
+    await staking.connect(owner).setLockDuration(0n);
+    await staking.connect(owner).createPoll(1n, 3600n, 2, pollMeta(1, 2));
+    await staking.connect(user).stakePlatform(ethers.parseEther("100"), meta("borrowed"));
+    await staking.connect(user).voteOnPoll(1n, 1n, 0, 1n);
+    await expect(staking.connect(user).unstake(1n)).to.be.revertedWithCustomError(staking, "LockedByVote");
+  });
+
+  it("a poll cannot be extended once it has votes", async () => {
+    const { owner, user, staking } = await deployTestStack();
+    await staking.connect(user).stakePlatform(ethers.parseEther("100"), meta("p"));
+    await staking.connect(owner).createPoll(1n, 3600n, 2, pollMeta(1, 2));
+    const { deadline } = await staking.pollState(1n);
+
+    // Before the first vote the deadline can still be extended.
+    await expect(staking.connect(owner).extendPollDeadline(1n, deadline + 100n))
+      .to.emit(staking, "PollDeadlineExtended")
+      .withArgs(1n, deadline + 100n);
+
+    await staking.connect(user).voteOnPoll(1n, 1n, 0, 1n);
+    await expect(staking.connect(owner).extendPollDeadline(1n, deadline + 200n)).to.be.revertedWithCustomError(
+      staking,
+      "PollHasVotes"
+    );
+    // The unlock time the voter saw when voting is final.
+    expect(await staking.voteLockedUntil(1n)).to.equal(deadline + 100n);
+  });
+
+  it("a poll with no votes finalizes with NO_WINNER, not option 0", async () => {
+    const { owner, staking } = await deployTestStack();
+    const NO_WINNER = await staking.NO_WINNER();
+    expect(NO_WINNER).to.equal(255);
+
+    await staking.connect(owner).createPoll(1n, 60n, 3, pollMeta(1, 3));
+    expect((await staking.pollState(1n)).winningOption).to.equal(NO_WINNER); // not finalized yet
+
+    await time.increase(61);
+    await expect(staking.connect(owner).finalizePoll(1n)).to.emit(staking, "PollFinalized").withArgs(1n, NO_WINNER);
+    const state = await staking.pollState(1n);
+    expect(state.finalized).to.equal(true);
+    expect(state.winningOption).to.equal(NO_WINNER);
+    expect((await staking.polls(1n)).totalVotes).to.equal(0n);
+  });
+
+  it("totalVotes sums every vote, and option 0 never wins without votes", async () => {
+    const { owner, user, other, staking } = await deployTestStack();
+    await staking.connect(user).stakePlatform(ethers.parseEther("100"), meta("a"));
+    await staking.connect(other).stakePlatform(ethers.parseEther("50"), meta("b"));
+    await staking.connect(owner).createPoll(1n, 3600n, 3, pollMeta(1, 3));
+    await staking.connect(user).voteOnPoll(1n, 1n, 1, 40n);
+    await staking.connect(other).voteOnPoll(1n, 2n, 2, 40n); // tie between options 1 and 2
+    expect((await staking.polls(1n)).totalVotes).to.equal(80n);
+
+    await time.increase(3601);
+    // Option 0 had no votes; the tie goes to the lowest index among the leaders.
+    await expect(staking.connect(owner).finalizePoll(1n)).to.emit(staking, "PollFinalized").withArgs(1n, 1);
   });
 });

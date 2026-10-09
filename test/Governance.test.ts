@@ -119,6 +119,24 @@ import { ethers } from "hardhat";
       );
     });
 
+    it("extendPollDeadline on an expired poll must set a deadline in the future", async () => {
+      const { owner, staking } = await deployTestStack();
+      await staking.connect(owner).createPoll(9n, 100n, 2, pollMeta(9, 2));
+      const { deadline } = await staking.pollState(9n);
+      await time.increase(200);
+
+      // Later than the old deadline, but still in the past: rejected.
+      await expect(staking.connect(owner).extendPollDeadline(9n, deadline + 50n)).to.be.revertedWithCustomError(
+        staking,
+        "InvalidDeadline"
+      );
+      // In the future: accepted, and the poll reopens.
+      const future = BigInt(await time.latest()) + 3600n;
+      await expect(staking.connect(owner).extendPollDeadline(9n, future))
+        .to.emit(staking, "PollDeadlineExtended")
+        .withArgs(9n, future);
+    });
+
     it("finalize poll picks option with most votes (after deadline)", async () => {
       const { owner, user, other, staking } = await deployTestStack();
       await staking.connect(user).stakePlatform(ethers.parseEther("200"), meta("p"));

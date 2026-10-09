@@ -20,7 +20,13 @@ describe("Full flow — case → stake → vote → close → unstake", () => {
     await staking.connect(owner).closeCase(caseId);
     expect(await staking.isCaseClosed(caseId)).to.equal(true);
 
+    // The normal lock is over, but the vote keeps the stake locked until the poll ends.
     await time.increaseTo(platPos.lockEnd + 1n);
+    await expect(staking.connect(user).unstake(1n)).to.be.revertedWithCustomError(staking, "LockedByVote");
+
+    const { deadline } = await staking.pollState(1n);
+    await time.increaseTo(deadline + 1n);
+    await staking.connect(owner).finalizePoll(1n);
     await staking.connect(user).unstake(1n);
     expect(await platformNFT.ownerOf(1n)).to.equal(user.address);
     expect(await staking.votingPower(1n)).to.equal(0n);

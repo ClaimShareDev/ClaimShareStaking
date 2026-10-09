@@ -573,3 +573,104 @@ describe("Coverage — Pausable base", () => {
     await expect(staking.connect(user).pause()).to.be.reverted;
   });
 });
+
+describe("Coverage — every privileged function rejects unauthorized callers", () => {
+  it("staking contract: each admin function checks its exact role", async () => {
+    const { owner, user, staking, usdt } = await deployTestStack();
+    const ADMIN = await staking.DEFAULT_ADMIN_ROLE();
+    const PAUSER = await staking.PAUSER_ROLE();
+    const CASE_MANAGER = await staking.CASE_MANAGER_ROLE();
+    const GOVERNANCE_ADMIN = await staking.GOVERNANCE_ADMIN_ROLE();
+    await staking.connect(owner).registerCase(1n, meta("c"));
+    await staking.connect(owner).createPoll(1n, 3600n, 2, pollMeta(1, 2));
+    const u = staking.connect(user);
+    const usdtAddr = await usdt.getAddress();
+
+    // Each call is started only when checked, so no rejection is left unhandled.
+    const cases: [() => Promise<unknown>, string][] = [
+      [() => u.registerCase(2n, meta("x")), CASE_MANAGER],
+      [() => u.deactivateCase(1n), CASE_MANAGER],
+      [() => u.closeCase(1n), CASE_MANAGER],
+      [() => u.createPoll(2n, 3600n, 2, pollMeta(2, 2)), GOVERNANCE_ADMIN],
+      [() => u.extendPollDeadline(1n, 10n ** 12n), GOVERNANCE_ADMIN],
+      [() => u.finalizePoll(1n), GOVERNANCE_ADMIN],
+      [() => u.setLockDuration(1n), ADMIN],
+      [() => u.setPlatformWeights(1n, 2n, 3n), ADMIN],
+      [() => u.setCaseWeights(1n, 2n, 3n), ADMIN],
+      [() => u.emergencyWithdraw(usdtAddr), ADMIN],
+      [() => u.pause(), PAUSER],
+      [() => u.unpause(), PAUSER],
+    ];
+    for (const [call, role] of cases) {
+      await expect(call()).to.be.revertedWithCustomError(staking, "AccessControlUnauthorizedAccount").withArgs(user.address, role);
+    }
+  });
+
+  it("position NFTs: wiring, minting and metadata check their roles", async () => {
+    const [owner, user] = await ethers.getSigners();
+    const nft = await (await ethers.getContractFactory("PlatformPositionNFT")).deploy(owner.address);
+    const ADMIN = await nft.DEFAULT_ADMIN_ROLE();
+    const MINTER = await nft.MINTER_ROLE();
+    await nft.connect(owner).mint(owner.address, 1n, "ipfs://a");
+    const u = nft.connect(user);
+
+    await expect(u.wireStaking(user.address))
+      .to.be.revertedWithCustomError(nft, "AccessControlUnauthorizedAccount")
+      .withArgs(user.address, ADMIN);
+    await expect(u.mint(user.address, 2n, "ipfs://b"))
+      .to.be.revertedWithCustomError(nft, "AccessControlUnauthorizedAccount")
+      .withArgs(user.address, MINTER);
+    await expect(u.setTokenURI(1n, "ipfs://c"))
+      .to.be.revertedWithCustomError(nft, "AccessControlUnauthorizedAccount")
+      .withArgs(user.address, MINTER);
+  });
+
+  it("case-position votes are blocked while paused", async () => {
+    const { owner, user, staking } = await deployTestStack();
+    await staking.connect(owner).registerCase(1n, meta("c"));
+    await staking.connect(user).stakeCase(1n, ethers.parseEther("10"), meta("p"));
+    await staking.connect(owner).createPoll(1n, 3600n, 2, pollMeta(1, 2));
+    await staking.connect(owner).pause();
+    await expect(staking.connect(user).voteOnPollCase(1n, 1n, 0, 1n)).to.be.revertedWithCustomError(
+      staking,
+      "EnforcedPause"
+    );
+  });
+});
+
+describe("Coverage — reentrancy guard", () => {
+  // A contract staker gets a callback when its position NFT is minted. Any attempt to call back
+  // into stake, stakeCase or unstake during that callback must revert.
+  async function deployAttacker() {
+    const ctx = await deployTestStack();
+    const { owner, claim, staking } = ctx;
+    await staking.connect(owner).registerCase(1n, meta("c"));
+    const attacker = await (await ethers.getContractFactory("ReentrantStaker")).deploy(
+      await staking.getAddress(),
+      await claim.getAddress()
+    );
+    await claim.mint(await attacker.getAddress(), ethers.parseEther("1000"));
+    return { ...ctx, attacker };
+  }
+
+  it("a contract staker without re-entry stakes normally", async () => {
+    const { attacker, staking } = await deployAttacker();
+    await attacker.stake(ethers.parseEther("10"));
+    expect((await staking.positions(1n)).owner).to.equal(await attacker.getAddress());
+  });
+
+  for (const [mode, label] of [
+    [1, "stakePlatform"],
+    [2, "stakeCase"],
+    [3, "unstake"],
+  ] as const) {
+    it(`re-entering ${label} from the NFT callback reverts`, async () => {
+      const { attacker, staking } = await deployAttacker();
+      await attacker.setMode(mode);
+      await expect(attacker.stake(ethers.parseEther("10"))).to.be.revertedWithCustomError(
+        staking,
+        "ReentrancyGuardReentrantCall"
+      );
+    });
+  }
+});
