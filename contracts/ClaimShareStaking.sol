@@ -79,12 +79,15 @@ contract ClaimShareStaking is ReentrancyGuard, ClaimSharePausable {
     uint8 public constant NO_WINNER = type(uint8).max;
 
     /// @notice Token users stake. Set once at deploy.
-    /// @dev Supported: an ERC-20 whose balances change only through transfers (no rebasing).
-    ///      Transfer fees deducted from the amount moved are supported in both directions:
-    ///      a stake credits only what arrives, and on unstake the holder bears the fee
-    ///      (`UnstakeReceived` reports what arrived). A token that takes more than the
-    ///      transfer amount from the sender is not supported: unstake reverts with
-    ///      `UnsupportedStakeToken` instead of paying from other positions.
+    /// @dev Production uses CLAIM 0x312E8d3caddC69F131AA077ceA0F98ED03be66ac. CLAIM is not a
+    ///      standard ERC-20: it has tax and transfer-control logic. Its taxFee is zero and
+    ///      cannot be changed, so no fee is applied today.
+    ///      Supported: an ERC-20 whose balances change only through transfers (no rebasing).
+    ///      A stake credits only what arrives. On unstake the holder bears a fee taken from
+    ///      the amount received; `UnstakeReceived` reports that amount and does not reject it.
+    ///      `UnsupportedStakeToken` reverts only when this contract's balance drops by more
+    ///      than the position amount. A tax that debits the full amount here and delivers
+    ///      less to the holder does not trigger that check.
     IERC20 public immutable stakeToken;
     PlatformPositionNFT public immutable platformNFT;
     CasePositionNFT public immutable caseNFT;
