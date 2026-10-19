@@ -49,13 +49,13 @@ Three production contracts plus test-only contracts:
 - `emergencyWithdraw(token)` recovers stranded ERC-20 tokens **but explicitly reverts if `token == stakeToken`** so user deposits can never be drained.
 
 ### Stake token requirements and transfer semantics
-The stake token is fixed at deploy (CLAIM in production). The contract supports an ERC-20 whose balances change only through transfers, and handles transfer fees explicitly:
+The stake token is fixed at deploy. Production uses CLAIM `0x312E8d3caddC69F131AA077ceA0F98ED03be66ac` on Base. CLAIM is not a standard ERC-20: it includes tax and transfer-control logic. Its `taxFee` is zero and cannot be changed, so no transfer fee is applied. The contract supports an ERC-20 whose balances change only through transfers, and handles transfer fees as follows:
 
 | Token behavior | Supported | What the contract does |
 | --- | --- | --- |
-| Standard ERC-20 (CLAIM) | Yes | Credits and returns the exact amount. |
+| CLAIM with `taxFee` 0 (current) | Yes | Credits and returns the exact amount, because no fee is applied. |
 | Fee deducted from a transfer, on stake | Yes | Credits only the balance increase (`balanceAfter - balanceBefore`); `StakedPlatform` / `StakedCase` emit that amount. A stake where nothing arrives reverts with `ZeroAmount`. |
-| Fee deducted from a transfer, on unstake | Yes | Sends the full position amount; the holder bears the fee. `Unstaked` emits the amount sent, `UnstakeReceived` emits what the holder actually received. |
+| Fee deducted from a transfer, on unstake | Yes | Sends the full position amount; the holder bears the fee. `Unstaked` emits the amount sent. `UnstakeReceived` reports what the holder actually received and does not reject a smaller amount. A CLAIM-style tax still debits the staking contract for the full position amount, so `UnsupportedStakeToken` does not catch it. |
 | Token that takes more than the transfer amount from the sender | No | `unstake` reverts with `UnsupportedStakeToken`, so it can never pay out of other positions. |
 | Rebasing token | No | Not supported. Balances must change only through transfers. |
 | Tokens sent directly to the contract | — | Never credited to any position. |
